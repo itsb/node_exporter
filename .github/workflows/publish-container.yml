@@ -41,6 +41,7 @@ jobs:
           go-version: 1.26.x
       - name: Run upstream tests and vet
         run: |
+          make unused
           make test
           go vet ./...
           make test-e2e
@@ -137,6 +138,7 @@ jobs:
           jq -e '([.manifests[].platform | select(.os == "linux") | .architecture] | sort) == ["amd64", "arm64"]' manifest.json
           digest="$(docker buildx imagetools inspect "$IMAGE_NAME:$version" --format '{{.Manifest.Digest}}')"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published image: %s@%s\n' "$IMAGE_NAME" "$digest"
           {
             echo "### Published patched node_exporter"
             echo "- Image: \`$IMAGE_NAME:$version\`"
