@@ -1,5 +1,8 @@
 # Node exporter
 
+This fork adds an opt-in PCI class include filter. See
+[fork container images and publishing](README-fork.md) for the patched GHCR image.
+
 [![Build Status](https://github.com/prometheus/node_exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/prometheus/node_exporter/actions/workflows/ci.yml)
 ![bsd workflow](https://github.com/prometheus/node_exporter/actions/workflows/bsd.yml/badge.svg)
 ![golangci-lint workflow](https://github.com/prometheus/node_exporter/actions/workflows/golangci-lint.yml/badge.svg)

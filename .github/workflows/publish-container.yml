@@ -1,0 +1,155 @@
+---
+name: Patched container
+
+on:
+  pull_request:
+    branches: [pci-release]
+  push:
+    branches: [pci-release, pcidevice-class-include]
+    tags: ['v*-pci.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patched-container-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  IMAGE_NAME: ghcr.io/itsb/node-exporter
+
+jobs:
+  test-build:
+    name: Test and build Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: 1.26.x
+      - name: Run upstream tests and vet
+        run: |
+          make test
+          go vet ./...
+          make test-e2e
+      - name: Build binary and container
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="$(cat VERSION)-pci-dev"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pci\.[0-9]+$ ]]
+            version="${GITHUB_REF_NAME#v}"
+            [[ "${version%-pci.*}" == "$(cat VERSION)" ]]
+          fi
+          build_date="$(git show -s --format=%cd --date=format:%Y%m%d-%H:%M:%S HEAD)"
+          created="$(git show -s --format=%cI HEAD)"
+          mkdir -p ".build/linux-$ARCH"
+          CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -trimpath \
+            -ldflags "-X github.com/prometheus/common/version.Version=$version \
+              -X github.com/prometheus/common/version.Revision=$GITHUB_SHA \
+              -X github.com/prometheus/common/version.Branch=$GITHUB_REF_NAME \
+              -X github.com/prometheus/common/version.BuildUser=github-actions \
+              -X github.com/prometheus/common/version.BuildDate=$build_date" \
+            -o ".build/linux-$ARCH/node_exporter" .
+          docker build --pull --build-arg "ARCH=$ARCH" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.url=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.documentation=https://github.com/$GITHUB_REPOSITORY/blob/pci-release/README-fork.md" \
+            --label "org.opencontainers.image.description=node_exporter with an opt-in PCI class include filter" \
+            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$created" \
+            -t "node-exporter-test:$ARCH" .
+      - name: Test the built container
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: .github/scripts/test-container.sh "node-exporter-test:$ARCH"
+      - name: Save tested image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker save "node-exporter-test:$ARCH" | gzip -n > "$RUNNER_TEMP/node-exporter-$ARCH.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: container-${{ matrix.arch }}
+          path: ${{ runner.temp }}/node-exporter-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish tested multi-platform container
+    needs: test-build
+    if: github.repository == 'itsb/node_exporter' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: container-*
+          path: images
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Publish tested images and manifest
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-publish
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pci\.[0-9]+$ ]]
+          version="${GITHUB_REF_NAME#v}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$IMAGE_NAME:$version" >/dev/null 2>&1; then
+            echo "::error::Version $version already exists; create a new release tag."
+            exit 1
+          fi
+          for arch in amd64 arm64; do
+            gzip -dc "images/node-exporter-$arch.tar.gz" | docker load
+            revision="$(docker image inspect "node-exporter-test:$arch" \
+              --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+            [[ "$revision" == "$GITHUB_SHA" ]]
+            docker tag "node-exporter-test:$arch" "$IMAGE_NAME:$version-$arch"
+            docker push "$IMAGE_NAME:$version-$arch"
+          done
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.description=node_exporter with an opt-in PCI class include filter" \
+            --annotation "index:org.opencontainers.image.version=$version" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE_NAME:$version" \
+            --tag "$IMAGE_NAME:sha-$GITHUB_SHA" \
+            "$IMAGE_NAME:$version-amd64" "$IMAGE_NAME:$version-arm64"
+          docker buildx imagetools inspect "$IMAGE_NAME:$version" --raw > manifest.json
+          jq -e '([.manifests[].platform | select(.os == "linux") | .architecture] | sort) == ["amd64", "arm64"]' manifest.json
+          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:$version" --format '{{.Manifest.Digest}}')"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Published patched node_exporter"
+            echo "- Image: \`$IMAGE_NAME:$version\`"
+            echo "- Pinned image: \`$IMAGE_NAME@$digest\`"
+            echo "- Platforms: Linux amd64 and arm64"
+            echo "- Source commit: \`$GITHUB_SHA\`"
+            echo "- [Package settings](https://github.com/users/itsb/packages/container/node-exporter/settings)"
+            echo ""
+            echo "For anonymous pulls, the GHCR package visibility must be public."
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api /users/itsb/packages/container/node-exporter --jq '{name, visibility, html_url}'
+      - name: Remove registry credentials
+        if: always()
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-publish
+        run: docker logout ghcr.io
